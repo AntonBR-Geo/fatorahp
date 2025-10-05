@@ -2,412 +2,449 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io, csv, re
-import matplotlib.pyplot as plt
 import seaborn as sns
+import matplotlib.pyplot as plt
+import time
+from io import StringIO
 
-st.set_page_config(page_title="AHP App — Robusto", layout="wide")
+st.set_page_config(page_title="📊 FatorAHP — Analisador de Fatores com AHP", layout="wide")
+sns.set_style("whitegrid")
 
-# =========================================================
-# Cabeçalho e tutorial
-# =========================================================
-st.title("📊 FatorAHP — Analisador de Fatores e Pesos com AHP")
-st.markdown("""
-### 📝 Como usar este aplicativo
-
-1. **Carregue o arquivo CSV** contendo **apenas os fatores numéricos** que deseja analisar  
-   - O arquivo deve conter:  
-     - Primeira linha = nomes das variáveis (ex: `Fator1;Fator2;Fator3`).  
-     - Demais linhas = valores numéricos.  
-   - ⚠️ Não inclua colunas de identificação, nomes ou códigos — apenas os fatores.
-
-2. **Estatísticas Descritivas**  
-   - O app calcula média, desvio padrão, coeficiente de variação (CV), quartis, etc.
-
-3. **Histogramas com densidade**  
-   - Para verificar a distribuição de cada fator (simetria, outliers, modas).
-
-4. **Matriz AHP**  
-   - Use a sugestão automática (baseada em média + CV) ou preencha manualmente.  
-   - No modo manual, edite apenas o triângulo superior — os inversos são preenchidos automaticamente.
-
-5. **Cálculo final**  
-   - O app exibe os pesos dos fatores, λmáx, CI e CR.  
-   - Também mostra um ranking com classificação da importância (Muito Alta, Alta, Média, Baixa).
-
----
-""")
-
-# -------------------------
-# Utilitários para leitura do CSV (robusto)
-# -------------------------
+# ---------------------------
+# Funções utilitárias
+# ---------------------------
 def try_decode(raw_bytes):
-    for enc in ('utf-8', 'latin1', 'cp1252'):
+    for enc in ("utf-8", "latin1", "cp1252", "iso-8859-1"):
         try:
-            s = raw_bytes.decode(enc)
-            return s, enc
+            return raw_bytes.decode(enc), enc
         except Exception:
             continue
-    return raw_bytes.decode('utf-8', errors='replace'), 'utf-8'
+    return raw_bytes.decode("utf-8", errors="replace"), "utf-8"
+
+def detect_sep_by_counts(text, candidates=[';', ',', '\t', '|'], n_lines=50):
+    lines = [ln for ln in text.splitlines() if ln.strip()!=''][:n_lines]
+    if not lines:
+        return ';'
+    stats = {}
+    for s in candidates:
+        counts = [len(ln.split(s)) for ln in lines]
+        stats[s] = (np.median(counts), np.std(counts))
+    best = max(stats.items(), key=lambda kv: (kv[1][0], -kv[1][1]))[0]
+    return best
 
 def read_csv_flexible(uploaded_file):
     uploaded_file.seek(0)
     raw = uploaded_file.read()
-    text, encoding = try_decode(raw)
-
-    # Tentativas comuns: (sep, decimal)
-    attempts = [
-        (';', ','),   # comum em BR: ; e decimal vírgula
-        (',', '.'),   # csv padrão en/us
-        ('\t', '.'),  # tsv
-        ('|', '.'),
-    ]
-
-    for sep, decimal in attempts:
-        try:
-            df = pd.read_csv(io.StringIO(text), sep=sep, decimal=decimal, engine='python')
-            # se resultou mais de 1 coluna plausível -> sucesso
-            if df.shape[1] > 1:
-                return df, sep, decimal, encoding
-            # se apenas uma coluna, pode ainda estar correto (um campo apenas)
-        except Exception:
-            pass
-
-    # Tentar csv.Sniffer (pode falhar quando há vírgulas decimais)
+    if isinstance(raw, bytes):
+        text, enc_guess = try_decode(raw)
+    else:
+        text = raw
+        enc_guess = 'utf-8'
+    # try common BR
     try:
-        dialect = csv.Sniffer().sniff(text[:4096], delimiters=[',',';','\t','|'])
-        sep = dialect.delimiter
-        # tentar duas opções de decimal
-        for decimal in [',', '.']:
-            try:
-                df = pd.read_csv(io.StringIO(text), sep=sep, decimal=decimal, engine='python')
-                if df.shape[1] > 1:
-                    return df, sep, decimal, encoding
-            except Exception:
-                pass
+        df = pd.read_csv(StringIO(text), sep=';', decimal=',', engine='c')
+        return df, ';', ',', enc_guess
     except Exception:
         pass
-
-    # fallback: se é uma única coluna com delimitadores dentro das linhas, split manualmente
-    lines = [ln for ln in text.splitlines() if ln.strip()!='']
-    if len(lines) > 0:
-        # detecta separador mais frequente nas linhas
-        counts = {d: sum(ln.count(d) for ln in lines[:20]) for d in [';', ',', '\t', '|']}
-        sep = max(counts, key=counts.get)
-        # split
-        rows = [re.split(r'[;,\t|]', ln) for ln in lines]
-        header = rows[0]
-        data = rows[1:]
-        df = pd.DataFrame(data, columns=header)
-        # assumimos decimal = ',' se sep == ';' (heurística)
-        decimal = ',' if sep == ';' else '.'
-        return df, sep, decimal, encoding
-
-    # última tentativa: usar pandas autodetect
+    sep_guess = detect_sep_by_counts(text)
+    for dec in [',', '.']:
+        try:
+            df = pd.read_csv(StringIO(text), sep=sep_guess, decimal=dec, engine='c')
+            return df, sep_guess, dec, enc_guess
+        except Exception:
+            continue
     try:
-        uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file, engine='python')
-        return df, ',', '.', encoding
+        df = pd.read_csv(StringIO(text), engine='python')
+        return df, 'auto', 'auto', enc_guess
     except Exception as e:
-        raise ValueError(f"Não foi possível ler o CSV automaticamente: {e}")
+        raise e
 
-def clean_and_convert(df, decimal_hint):
+def clean_and_numeric(df, decimal_hint=','):
     df = df.copy()
-    # limpar nomes
     df.columns = [str(c).strip() for c in df.columns]
     for c in df.columns:
         s = df[c].astype(str).str.strip()
-        s = s.str.replace(r'(^"|"$)', '', regex=True)  # remove aspas extremas
-        s = s.str.replace(r'\s+', '', regex=True)      # remove espaços
-        # se decimal_hint for ',' tratamos possíveis milhares com '.' e vírgula como decimal
+        s = s.str.replace(r'(^"|"$)', '', regex=True)
+        s = s.str.replace(r'\s+', '', regex=True)
         if decimal_hint == ',':
-            # remover pontos que atuam como separador de milhares (heurística)
-            # somente se existirem padrões como \d.\d{3}
-            s = s.str.replace(r'\.(?=\d{3}(?:[\.\,]|$))', '', regex=True)
+            s = s.str.replace(r'\.(?=\d{3}(?:[\.|,]|$))', '', regex=True)
             s = s.str.replace(',', '.')
         else:
-            # remove vírgulas como separador de milhares
             s = s.str.replace(',', '', regex=True)
         df[c] = pd.to_numeric(s, errors='coerce')
-    # drop colunas completamente nulas
+    # drop fully NaN columns
     df = df.loc[:, df.notna().any(axis=0)]
     return df
 
-# -------------------------
-# AHP: gerar matriz a partir da heurística (distância média a 1)
-# -------------------------
-def gerar_matriz_sugestao(df_norm):
-    # df_norm: DataFrame numérico (de preferência normalizado média=1)
-    distancias = df_norm.apply(lambda col: np.nanmean(np.abs(col - 1)), axis=0).to_dict()
-    # ordenar por menor distância (maior prioridade)
-    ordenado = sorted(distancias.items(), key=lambda x: x[1])
-    variaveis = [v for v,_ in ordenado]
-    n = len(variaveis)
-    # scores inteiros: 1º -> n, 2º -> n-1, ..., último -> 1
-    scores_int = {variaveis[i]: n - i for i in range(n)}
-    # construir matriz (usar razão de scores e arredondar para inteiro Saaty)
-    matriz = np.ones((n,n), dtype=float)
-    for i in range(n):
-        for j in range(i+1, n):
-            ratio = scores_int[variaveis[i]] / scores_int[variaveis[j]]
-            ratio_r = int(round(ratio))
-            ratio_r = min(max(ratio_r, 1), 9)
-            matriz[i,j] = ratio_r
-            matriz[j,i] = 1.0 / ratio_r
-    df_scores = pd.DataFrame({
-        "Variável": variaveis,
-        "Distância Média a 1": [distancias[v] for v in variaveis],
-        "Score (inteiro)": [scores_int[v] for v in variaveis]
+def descriptive_stats(df):
+    stats = pd.DataFrame({
+        "Média": df.mean(),
+        "Mediana": df.median(),
+        "Desvio Padrão": df.std(),
+        "CV": (df.std() / df.mean()).replace([np.inf, -np.inf], np.nan).fillna(0),
+        "Mínimo": df.min(),
+        "Máximo": df.max(),
+        "Q1": df.quantile(0.25),
+        "Q3": df.quantile(0.75)
     })
-    matriz_df = pd.DataFrame(matriz, index=variaveis, columns=variaveis)
-    return matriz_df, df_scores
+    return stats
 
-# -------------------------
-# AHP: cálculo de pesos e índices
-# -------------------------
-def calcular_ahp_indices(A):
-    # A deve ser matriz quadrada, recíproca (ou quase)
-    A = np.array(A, dtype=float)
-    n = A.shape[0]
-    # Normalização por coluna e média das linhas (método de média - fallback)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        col_sums = A.sum(axis=0)
-        matriz_norm = A / col_sums
-        pesos_rowmean = np.nanmean(matriz_norm, axis=1)
-    # Método de autovetor (mais preciso)
-    try:
-        autovalores, autovetores = np.linalg.eig(A)
-        # escolher autovalor com maior parte real
-        index_max = np.argmax(autovalores.real)
-        lambda_max = autovalores[index_max].real
-        vetor = autovetores[:, index_max].real
-        pesos = np.abs(vetor)
-        if pesos.sum() == 0:
-            pesos = pesos_rowmean
-        else:
-            pesos = pesos / pesos.sum()
-    except Exception:
-        # fallback
-        pesos = pesos_rowmean
-        lambda_max = np.nan
-
-    # CI e CR
-    CI = (lambda_max - n) / (n - 1) if n > 1 and not np.isnan(lambda_max) else 0.0
-    RI_table = {1:0.00,2:0.00,3:0.58,4:0.90,5:1.12,6:1.24,7:1.32,8:1.41,9:1.45,10:1.49}
-    RI = RI_table.get(n, 1.49)
-    CR = CI / RI if RI > 0 else 0.0
-    return pesos, lambda_max, CI, CR
-
-# -------------------------
-# Função: aplica reciprocidade/valida escala Saaty a partir da matriz editada
-# -------------------------
-def enforce_reciprocity_and_scale(df_matrix):
-    M = df_matrix.copy().astype(float).values
-    n = M.shape[0]
-    # garantir diagonal 1
-    for i in range(n):
-        M[i,i] = 1.0
-    # para cada par i<j, decidir valor principal e aplicar inverso
-    for i in range(n):
-        for j in range(i+1, n):
-            aij = M[i,j]
-            aji = M[j,i]
-            # se aij é nan ou zero, mas aji existe -> usar aji
-            if not np.isfinite(aij) or aij == 0:
-                if np.isfinite(aji) and aji != 0:
-                    val = float(aji)
-                    # se usuário preencheu menor que 1 assume que foi inverso então invert
-                    if val < 1:
-                        val = 1.0 / val
-                    # clamp 1..9
-                    val = min(max(val, 1.0), 9.0)
-                    M[i,j] = val
-                    M[j,i] = 1.0 / val
-                else:
-                    # nenhum valor fornecido -> assume 1
-                    M[i,j] = 1.0
-                    M[j,i] = 1.0
-            else:
-                val = float(aij)
-                # se o usuário digitar um valor <1 no triângulo superior, interpretamos como inverso
-                if val < 1:
-                    val = 1.0 / val
-                val = min(max(val, 1.0), 9.0)
-                M[i,j] = val
-                M[j,i] = 1.0 / val
-    return pd.DataFrame(M, index=df_matrix.index, columns=df_matrix.columns)
-
-# -------------------------
-# UI e fluxo principal
-# -------------------------
-st.sidebar.header("Upload & Config")
-uploaded = st.sidebar.file_uploader("Carregar CSV (sep: ; ou , ou \\t)", type=['csv', 'txt'])
-
-if uploaded is not None:
-    try:
-        df_raw, detected_sep, detected_decimal, encoding = read_csv_flexible(uploaded)
-    except Exception as e:
-        st.error(f"Erro ao ler o arquivo automaticamente: {e}")
-        st.stop()
-
-    st.markdown("### 🗂️ Dados carregados (preview)")
-    st.write(f"**Detectado:** separador = `{detected_sep}`, decimal_hint = `{detected_decimal}`, encoding = `{encoding}`")
-    st.dataframe(df_raw.head(8))
-
-    # conversão
-    df_clean = clean_and_convert(df_raw, detected_decimal)
-    if df_clean.shape[1] == 0:
-        st.error("Não foram detectadas colunas numéricas após a conversão. Verifique o separador/decimal do arquivo.")
-        st.stop()
-
-    st.markdown("### 📈 Estatísticas Descritivas (após conversão para numérico)")
-    st.write(df_clean.describe().T)
-
-    # opção de normalizar (média = 1)
-    big_means = (df_clean.mean().abs() > 10).any()
-    if big_means:
-        st.warning("Algumas variáveis têm média muito alta — normalizar para média = 1 é recomendado para a heurística.")
-    normalizar = st.checkbox("Normalizar variáveis para média = 1 (recomendado)", value=True)
-
-    if normalizar:
-        means = df_clean.mean().replace(0, np.nan)
-        df_norm = df_clean.divide(means, axis=1).fillna(0)
-    else:
-        df_norm = df_clean.copy()
-
-    st.markdown("### 🔎 Preview (dados usados para calcular Distância Média a 1)")
-    st.dataframe(df_norm.head(8))
-
-    # ---------- NOVO: histogramas COM DENSIDADE (antes do Passo 3) ----------
-    st.markdown("### 📊 Visualização de Histograma com Densidade")
-    st.caption("O histograma ajuda a identificar assimetrias, múltiplas modas e outliers — barras azuis (frequência/densidade) e linha vermelha (densidade).")
-
-    cols = st.columns(3)
-    for i, col in enumerate(df_norm.columns):
-        fig, ax = plt.subplots(figsize=(6, 3.5))
+def plot_histograms_brazil(df, cols_per_row=2, wait=0.12):
+    cols = st.columns(cols_per_row)
+    for i, col in enumerate(df.columns):
+        fig, ax = plt.subplots(figsize=(5,3))
+        sns.histplot(df[col].dropna(), bins=30, stat="density", color="skyblue", alpha=0.7, ax=ax, edgecolor='black', linewidth=0.3)
         try:
-            sns.histplot(df_norm[col].dropna(), bins=20, stat="density", color="skyblue", alpha=0.7, ax=ax)
-        except Exception:
-            ax.hist(df_norm[col].dropna(), bins=20, density=True, alpha=0.6)
-        try:
-            sns.kdeplot(df_norm[col].dropna(), color="red", ax=ax, linewidth=2)
+            sns.kdeplot(df[col].dropna(), color="red", ax=ax, linewidth=2)
         except Exception:
             pass
         ax.set_title(f"Histograma e Curva de Densidade de {col}")
-        ax.set_xlabel(col)
-        ax.set_ylabel("Densidade")
-        with cols[i % 3]:
+        # format axis ticks labels as text with comma
+        try:
+            xt = ax.get_xticks()
+            ax.set_xticklabels([f"{x:.2f}".replace(".", ",") for x in xt])
+            yt = ax.get_yticks()
+            ax.set_yticklabels([f"{y:.2f}".replace(".", ",") for y in yt])
+        except Exception:
+            pass
+        with cols[i % cols_per_row]:
             st.pyplot(fig)
-    # -----------------------------------------------------------------------
+        plt.close(fig)
+        time.sleep(wait)
 
-    # gerar sugestão
-    matriz_sugerida, tabela_scores = gerar_matriz_sugestao(df_norm)
-    st.markdown("### 🎯 Passo 3: Tabela de Pontuações (base da sugestão AHP)")
-    st.dataframe(tabela_scores)
+def compute_scores(df_for_scores):
+    dist_med = df_for_scores.apply(lambda col: np.nanmean(np.abs(col - 1.0)))
+    cv = (df_for_scores.std() / df_for_scores.mean().replace(0, np.nan)).fillna(0)
+    combined = (dist_med + cv) / 2.0
+    order = np.argsort(combined.values)  # smaller is better
+    n = len(combined)
+    scores_int = np.zeros(n, dtype=int)
+    for rank_pos, idx in enumerate(order):
+        scores_int[idx] = n - rank_pos
+    df_scores = pd.DataFrame({
+        "Variável": df_for_scores.columns,
+        "Distância Média a 1": dist_med.values,
+        "CV": cv.reindex(df_for_scores.columns).values,
+        "Score (inteiro)": scores_int
+    })
+    df_scores = df_scores.sort_values("Score (inteiro)", ascending=False).reset_index(drop=True)
+    return df_scores
 
-    # escolha entre sugestão editável ou preencher manualmente
-    st.markdown("---")
-    st.markdown("### 🧮 Passo 4: Matriz de Comparação Pareada (Sugestão ou Manual)")
-    modo = st.radio("Modo de preenchimento:", ["Usar Sugestão Automática", "Preencher Manualmente"], horizontal=True)
+def map_ratio_to_saaty(ratio):
+    try:
+        r = float(ratio)
+    except Exception:
+        return 1
+    if r <= 0:
+        return 1
+    if r < 1:
+        r = 1.0 / r
+    r = min(max(r, 1.0), 9.0)
+    return int(round(r))
 
-    variaveis = matriz_sugerida.index.tolist()
-    n = len(variaveis)
+def build_suggested_matrix_from_scores(df_scores):
+    ordered = df_scores["Variável"].tolist()
+    scores = df_scores.set_index("Variável")["Score (inteiro)"].to_dict()
+    n = len(ordered)
+    A = np.ones((n,n), dtype=float)
+    for i in range(n):
+        for j in range(i+1, n):
+            si = scores[ordered[i]]
+            sj = scores[ordered[j]]
+            ratio = si / sj if sj != 0 else 9.0
+            val = map_ratio_to_saaty(ratio)
+            A[i,j] = val
+            A[j,i] = 1.0 / val
+    return pd.DataFrame(A, index=ordered, columns=ordered)
 
-    if modo == "Usar Sugestão Automática":
-        st.info("Matriz sugerida (você pode editar os valores). Preferencialmente edite somente o triângulo superior; o sistema ajustará os inversos ao calcular.")
-        try:
-            # nova API
-            edited = None
-            try:
-                edited = st.data_editor(matriz_sugerida, num_rows="fixed", use_container_width=True)
-            except Exception:
-                edited = st.experimental_data_editor(matriz_sugerida, num_rows="fixed", use_container_width=True)
-            matriz_editada = edited.copy()
-        except Exception:
-            st.warning("Editor interativo não disponível — exibindo apenas a sugestão.")
-            st.dataframe(matriz_sugerida)
-            matriz_editada = matriz_sugerida.copy()
-    else:
-        st.info("Preencha manualmente os valores **apenas no triângulo superior** (acima da diagonal). "
-                "Os valores da parte inferior serão preenchidos automaticamente com os inversos.")
-
-        matriz_manual = pd.DataFrame(np.eye(n), index=variaveis, columns=variaveis)
-
-        try:
-            edited = None
-            try:
-                edited = st.data_editor(matriz_manual, num_rows="fixed", use_container_width=True)
-            except Exception:
-                edited = st.experimental_data_editor(matriz_manual, num_rows="fixed", use_container_width=True)
-
-            # aplicar reciprocidade logo após edição
-            matriz_editada = enforce_reciprocity_and_scale(edited.copy())
-
-            st.subheader("Matriz (com inversos aplicados automaticamente)")
-            st.dataframe(matriz_editada.style.format("{:.4f}"))
-
-        except Exception:
-            st.warning("Editor interativo não disponível — exibindo matriz identidade.")
-            st.dataframe(matriz_manual)
-            matriz_editada = matriz_manual.copy()
-    
-    # guardamos matriz editada na sessão
-    st.session_state['matriz_editada'] = matriz_editada
-
-    st.markdown("---")
-    st.markdown("### 📌 Passo 5: Cálculo e Resultados do AHP")
-
-    if st.button("Calcular AHP"):
-        try:
-            matriz_ed = st.session_state.get('matriz_editada').copy()
-            # converter tudo para numérico
-            for c in matriz_ed.columns:
-                matriz_ed[c] = pd.to_numeric(matriz_ed[c], errors='coerce')
-
-            # aplicar reciprocidade e escala Saaty
-            matriz_final = enforce_reciprocity_and_scale(matriz_ed)
-
-            # calcular índices e pesos
-            pesos, lambda_max, CI, CR = calcular_ahp_indices(matriz_final.values)
-            pesos = np.array(pesos, dtype=float)
-            if pesos.sum() == 0:
-                st.error("Erro: pesos calculados como zeros. Verifique os valores da matriz.")
-                st.stop()
-            pesos_pct = (pesos / pesos.sum()) * 100
-
-            # exibir matriz final
-            st.subheader("🔢 Matriz Pareada Final (reciprocidade aplicada)")
-            st.dataframe(matriz_final.style.format("{:.4f}"))
-
-            # exibir pesos e ranking
-            df_pesos = pd.DataFrame({
-                "Variável": matriz_final.index,
-                "Peso (valor)": pesos,
-                "Importância (%)": pesos_pct
-            }).sort_values("Importância (%)", ascending=False).reset_index(drop=True)
-            df_pesos["Classificação"] = df_pesos["Importância (%)"].apply(
-                lambda p: "🟢 Muito Alta" if p >= 30 else ("🟡 Alta" if p >= 20 else ("🔵 Média" if p >= 10 else "🔴 Baixa"))
-            )
-
-            st.subheader("📊 Pesos dos Critérios e Classificação")
-            st.dataframe(df_pesos.style.format({"Importância (%)":"{:.2f}", "Peso (valor)":"{:.6f}"}))
-
-            # exibir índices de consistência
-            st.subheader("📏 Índices de Consistência")
-            st.write(f"- λmáx (autovalor máximo): **{lambda_max:.6f}**")
-            st.write(f"- CI (Índice de Consistência): **{CI:.6f}**")
-            st.write(f"- CR (Razão de Consistência): **{CR:.6f}**")
-            if CR < 0.1:
-                st.success("✅ Matriz consistente — julgamentos são lógicos.")
+def enforce_reciprocity_and_scale(df_matrix):
+    M = df_matrix.copy().astype(float)
+    n = M.shape[0]
+    for i in range(n):
+        M.iloc[i,i] = 1.0
+    for i in range(n):
+        for j in range(i+1,n):
+            aij = M.iloc[i,j]
+            aji = M.iloc[j,i]
+            if pd.notna(aij) and aij != 0:
+                val = float(aij)
+                if val < 1:
+                    val = 1.0 / val
+                val = min(max(val, 1.0), 9.0)
+                M.iloc[i,j] = val
+                M.iloc[j,i] = 1.0/val
+            elif pd.notna(aji) and aji != 0:
+                val = float(aji)
+                if val < 1:
+                    val = 1.0 / val
+                val = min(max(val, 1.0), 9.0)
+                M.iloc[i,j] = val
+                M.iloc[j,i] = 1.0/val
             else:
-                st.error("⚠️ Matriz inconsistente — revise seus julgamentos!")
+                M.iloc[i,j] = 1.0
+                M.iloc[j,i] = 1.0
+    return M
 
-            # botão de download
-            csv_bytes = df_pesos.to_csv(index=False).encode('utf-8')
-            st.download_button("⬇️ Baixar Pesos (CSV)", data=csv_bytes, file_name="ahp_pesos.csv", mime="text/csv")
+def ahp_calculation(A):
+    eigvals, eigvecs = np.linalg.eig(A)
+    max_eigval = np.max(np.real(eigvals))
+    max_index = np.argmax(np.real(eigvals))
+    w = np.real(eigvecs[:, max_index])
+    w = w / np.sum(w)
+    n = A.shape[0]
+    CI = (max_eigval - n) / (n - 1) if n > 1 else 0.0
+    RI_dict = {1:0.0,2:0.0,3:0.58,4:0.90,5:1.12,6:1.24,7:1.32,8:1.41,9:1.45,10:1.49}
+    RI = RI_dict.get(n, 1.49)
+    CR = CI / RI if RI != 0 else 0.0
+    return w, max_eigval, CI, CR
 
-        except Exception as e:
-            st.error(f"Erro no cálculo do AHP: {e}")
+def classify_percent(p):
+    if p >= 30:
+        return "🟢 Muito Alta"
+    elif p >= 20:
+        return "🟡 Alta"
+    elif p >= 10:
+        return "🔵 Média"
+    else:
+        return "🔴 Baixa"
 
+def format_num_br(x, fmt="{:.6f}"):
+    try:
+        return fmt.format(x).replace(".", ",")
+    except Exception:
+        return x
+
+# ---------------------------
+# Interface principal
+# ---------------------------
+st.title("📊 FatorAHP — Analisador de Fatores com AHP")
+st.markdown("""
+**Instruções rápidas:**  
+- Carregue um CSV (recomendado: separador `;` e decimal `,`).  
+- Seleccione as variáveis numéricas que deseja usar no AHP (aparecem deselecionadas por padrão).
+""")
+st.markdown("---")
+
+uploaded = st.file_uploader("Escolha um arquivo CSV (recomendado sep=';', decimal=',')", type=["csv","txt"])
+if not uploaded:
+    st.info("Carregue um CSV para iniciar.")
+    st.stop()
+
+# leitura
+try:
+    df_raw, detected_sep, detected_dec, enc = read_csv_flexible(uploaded)
+except Exception as e:
+    st.error(f"Erro ao ler o CSV. Mensagem: {e}")
+    st.stop()
+
+st.success(f"Lido com sucesso (sep='{detected_sep}', decimal='{detected_dec}', encoding='{enc}').")
+
+# Preview ajustado (expander)
+st.subheader("📊 Visualizar Dados Carregados")
+with st.expander("Prévia dos dados (primeiras 10 linhas)"):
+    st.markdown(
+        "<div style='color:#444;background:#f9f9f9;padding:8px;border-radius:6px;'>"
+        "⚠️ Confira se o arquivo contém apenas as variáveis que você deseja analisar no AHP."
+        "</div>",
+        unsafe_allow_html=True
+    )
+    st.dataframe(df_raw.head(10))
+
+# converter e detectar colunas numéricas
+try:
+    df_clean = clean_and_numeric(df_raw, decimal_hint=detected_dec if detected_dec else ',')
+except Exception as e:
+    st.error(f"Erro ao processar dados: {e}")
+    st.stop()
+
+if df_clean.shape[1] == 0:
+    st.error("Nenhuma coluna numérica detectada após conversão.")
+    st.stop()
+
+num_cols = df_clean.columns.tolist()
+non_num_cols = [c for c in df_raw.columns if c not in num_cols]
+if non_num_cols:
+    with st.expander("Colunas não-numéricas detectadas (serão ignoradas):"):
+        st.write(non_num_cols)
+
+# seleção de variáveis (aparecem deselecionadas por padrão)
+st.header("Passo 1 — Seleção de Variáveis")
+selected = st.multiselect("Escolha variáveis (aparecem desmarcadas):", options=num_cols, default=[])
+
+if len(selected) == 0:
+    st.warning("Selecione ao menos uma variável numérica para continuar.")
+    st.stop()
+
+# parâmetros
+min_valid_percent = st.sidebar.slider("Min % colunas não-nulas por linha (aplica-se às variáveis selecionadas)", 50, 100, 100, 5)
+normalize = st.sidebar.checkbox("Normalizar variáveis para média = 1 (recomendado)", value=True)
+cols_per_row = st.sidebar.select_slider("Colunas por fila nos histogramas", options=[1,2,3], value=2)
+hist_sleep = st.sidebar.slider("Pausa (s) entre histogramas)", 0.0, 0.5, 0.12, 0.02)
+
+# aplicar seleção e validar linhas
+df_selected = df_clean[selected].apply(pd.to_numeric, errors='coerce')
+n_selected = len(selected)
+min_required = int(np.ceil(n_selected * (min_valid_percent / 100.0)))
+df_valid = df_selected.dropna(thresh=min_required, axis=0).copy()
+
+if df_valid.shape[0] == 0:
+    st.error("Nenhuma linha válida após aplicar critérios. Ajuste o slider ou selecione menos variáveis.")
+    st.stop()
+
+st.success(f"{n_selected} variáveis selecionadas; {df_valid.shape[0]} linhas válidas após critério ({min_valid_percent}%).")
+
+# normalização opcional (média = 1)
+if normalize:
+    means = df_valid.mean().replace(0, np.nan)
+    df_for_scores = df_valid.divide(means, axis=1).fillna(0)
 else:
-    st.info("Carregue um CSV no sidebar. Dica: arquivos gerados no Brasil frequentemente usam `;` e `,` como decimal.")
+    df_for_scores = df_valid.copy()
+
+# Passo 2: Estatísticas + histogramas
+st.header("Passo 2 — Estatísticas Descritivas + Histogramas")
+stats = descriptive_stats(df_valid)
+stats_display = stats.round(6).astype(object)
+for c in stats_display.columns:
+    stats_display[c] = stats_display[c].apply(lambda x: format_num_br(x, "{:.6f}") if pd.notna(x) else "")
+st.dataframe(stats_display)
+
+st.info("Nota: CV indica dispersão — variáveis com CV alto são mais discriminatórias.")
+st.subheader("Histogramas com Densidade")
+plot_histograms_brazil(df_valid, cols_per_row=cols_per_row, wait=hist_sleep)
+
+# Passo 3: tabela de pontuações
+st.header("Passo 3 — Tabela de Pontuações (Distância média a 1 | CV | Score inteiro)")
+score_table = compute_scores(df_for_scores)
+score_table_display = score_table.copy()
+score_table_display["Distância Média a 1"] = score_table_display["Distância Média a 1"].map(lambda x: format_num_br(x, "{:.6f}"))
+score_table_display["CV"] = score_table_display["CV"].map(lambda x: format_num_br(x, "{:.6f}"))
+st.dataframe(score_table_display)
+
+# Passo 4: matriz sugestão & edição (robusto)
+st.header("Passo 4 — Matriz de Comparação Pareada (Sugestão automática)")
+A_suggest_df = build_suggested_matrix_from_scores(score_table)
+st.subheader("Matriz Sugerida (ordenada por Score — maior → menor)")
+st.dataframe(A_suggest_df.style.format("{:.4f}"))
+
+# inicializa session_state
+if "A_matrix" not in st.session_state or st.session_state.get("matrix_order") != list(A_suggest_df.index):
+    st.session_state["A_matrix"] = A_suggest_df.copy()
+st.session_state["matrix_order"] = list(A_suggest_df.index)
+
+st.info("✏️ Você pode editar a matriz abaixo. Preencha apenas o triângulo superior; inversos serão calculados automaticamente.")
+
+# function: robust matrix editor
+def matrix_editor_robust(df_initial):
+    n = df_initial.shape[0]
+    # try new data_editor
+    if hasattr(st, "data_editor"):
+        try:
+            edited = st.data_editor(df_initial, num_rows="fixed", use_container_width=True)
+            return edited
+        except Exception:
+            pass
+    # try experimental_data_editor
+    if hasattr(st, "experimental_data_editor"):
+        try:
+            edited = st.experimental_data_editor(df_initial, num_rows="fixed", use_container_width=True)
+            return edited
+        except Exception:
+            pass
+    # fallback: manual inputs (only if n reasonable)
+    if n > 12:
+        st.warning("Edição interativa não disponível na sua versão do Streamlit para matrizes grandes. A matriz sugerida será usada como final. Para editar matrizes grandes, atualize o Streamlit (recomendado).")
+        return df_initial.copy()
+    st.warning("Editor visual não disponível — exibindo campos numéricos para editar o triângulo superior.")
+    edited = df_initial.copy()
+    # render manual inputs row by row
+    for i in range(n):
+        cols = st.columns(n+1)
+        cols[0].markdown(f"**{edited.index[i]}**")
+        for j in range(n):
+            if i == j:
+                cols[j+1].markdown("1")
+                edited.iat[i,j] = 1.0
+            elif i < j:
+                default_val = float(df_initial.iat[i,j]) if pd.notna(df_initial.iat[i,j]) else 1.0
+                val = cols[j+1].number_input(f"{edited.index[i]} vs {edited.columns[j]}", min_value=0.001, max_value=100.0, value=default_val, step=0.1, format="%.4f", key=f"m_{i}_{j}")
+                edited.iat[i,j] = val
+            else:
+                # leave lower triangle blank for now
+                cols[j+1].markdown("")
+    return edited
+
+edited = matrix_editor_robust(st.session_state["A_matrix"])
+
+# apply reciprocity
+try:
+    edited_df = edited.copy()
+    A_enforced = enforce_reciprocity_and_scale(edited_df)
+    A_enforced = A_enforced.reindex(index=st.session_state["matrix_order"], columns=st.session_state["matrix_order"])
+    st.session_state["A_matrix"] = A_enforced
+    st.subheader("Matriz (com reciprocidade aplicada — ordem por Score mantida)")
+    st.dataframe(A_enforced.style.format("{:.4f}"))
+except Exception as e:
+    st.error(f"Erro ao aplicar reciprocidade: {e}")
+    st.dataframe(st.session_state["A_matrix"].style.format("{:.4f}"))
+
+# Passo 5: cálculo AHP
+st.header("Passo 5 — Cálculo e Resultados do AHP")
+if st.button("Calcular AHP"):
+    try:
+        A_final = st.session_state["A_matrix"].copy().astype(float)
+        A_final = enforce_reciprocity_and_scale(A_final)
+        w, lam, CI, CR = ahp_calculation(A_final.values)
+        weights_df = pd.DataFrame({
+            "Variável": list(A_final.index),
+            "Peso (valor)": w,
+            "Importância (%)": (w * 100)
+        }).sort_values("Peso (valor)", ascending=False).reset_index(drop=True)
+
+        weights_df["Classificação"] = weights_df["Importância (%)"].apply(classify_percent)
+
+        # exibir tabela de pesos (formatada BR)
+        display_df = weights_df.copy()
+        display_df_fmt = display_df.copy()
+        display_df_fmt["Peso (valor)"] = display_df_fmt["Peso (valor)"].map(lambda x: format_num_br(x, "{:.6f}"))
+        display_df_fmt["Importância (%)"] = display_df_fmt["Importância (%)"].map(lambda x: format_num_br(x, "{:.2f}"))
+        st.subheader("📊 Pesos dos Critérios e Classificação")
+        st.dataframe(display_df_fmt, use_container_width=True)
+
+        # índices de consistência
+        st.subheader("📐 Índices de Consistência")
+        st.write(f"- λmáx (autovalor máximo): **{format_num_br(lam, '{:.6f}')}**")
+        st.write(f"- CI (Índice de Consistência): **{format_num_br(CI, '{:.6f}')}**")
+        st.write(f"- CR (Razão de Consistência): **{format_num_br(CR, '{:.6f}')}**")
+        if CR < 0.1:
+            st.success("✅ Matriz consistente — julgamentos são lógicos.")
+        else:
+            st.warning("⚠️ Matriz inconsistente — revise seus julgamentos!")
+
+        # ranking e download
+        ranking = display_df.copy()
+        ranking["Peso (valor)"] = ranking["Peso (valor)"].map(lambda x: float(x))
+        ranking["Importância (%)"] = ranking["Importância (%)"].map(lambda x: float(x))
+        ranking = ranking.sort_values("Peso (valor)", ascending=False).reset_index(drop=True)
+
+        st.subheader("🏆 Ranking Final")
+        ranking_fmt = ranking.copy()
+        ranking_fmt["Peso (valor)"] = ranking_fmt["Peso (valor)"].map(lambda x: format_num_br(x, "{:.6f}"))
+        ranking_fmt["Importância (%)"] = ranking_fmt["Importância (%)"].map(lambda x: format_num_br(x, "{:.2f}"))
+        st.dataframe(ranking_fmt, use_container_width=True)
+
+        # export CSV com vírgula decimal
+        out_df = ranking.copy()
+        out_df["Peso (valor)"] = out_df["Peso (valor)"].map(lambda x: format_num_br(x, "{:.6f}"))
+        out_df["Importância (%)"] = out_df["Importância (%)"].map(lambda x: format_num_br(x, "{:.6f}"))
+        csv_main = out_df.to_csv(index=False, sep=';', encoding='utf-8-sig')
+
+        extra = "\n\nÍndices de Consistência:\n"
+        extra += f"λmáx;{format_num_br(lam,'{:.6f}')}\n"
+        extra += f"CI;{format_num_br(CI,'{:.6f}')}\n"
+        extra += f"CR;{format_num_br(CR,'{:.6f}')}\n"
+        final_bytes = (csv_main + extra).encode('utf-8-sig')
+
+        st.download_button("⬇️ Baixar ranking/pesos + índices (CSV)", data=final_bytes, file_name="ahp_ranking_indices.csv", mime="text/csv; charset=utf-8")
+    except Exception as e:
+        st.error(f"Erro no cálculo do AHP: {e}")
+
